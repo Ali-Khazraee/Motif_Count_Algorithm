@@ -1,3 +1,5 @@
+# data.py
+
 import numpy as np
 import torch
 from typing import Dict
@@ -35,8 +37,6 @@ class DataLoader:
         
     def load_data(self) -> None:
         """Load the Cora dataset using DGL."""
-        # print("Loading Cora dataset from DGL...")
-        
         # Load the dataset
         dataset = CoraGraphDataset()
         self.graph = dataset[0]
@@ -68,13 +68,6 @@ class DataLoader:
         
         # Create adjacency matrix
         self._create_adjacency_matrix()
-        
-        # print(f"Dataset loaded successfully!")
-        # print(f"Number of nodes: {self.num_nodes}")
-        # print(f"Number of features: {self.num_features}")
-        # print(f"Number of classes: {self.num_classes}")
-        # print(f"Number of edges: {len(self.edges)}")
-        # print(f"Train/Val/Test: {self.train_mask.sum()}/{self.val_mask.sum()}/{self.test_mask.sum()}")
         
     def _create_adjacency_matrix(self) -> None:
         """Create adjacency matrix from the graph as tensor."""

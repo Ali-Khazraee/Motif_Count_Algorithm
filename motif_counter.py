@@ -1,28 +1,87 @@
 # motif_counter.py
 
 import torch
+import pickle
 import numpy as np
+from pathlib import Path
 from typing import List, Dict, Tuple, Any
-
-from motif_store import RuleBasedMotifStore
 
 
 class RelationalMotifCounter:
     """
     Counts motifs in a graph using relational algebra and Bayesian Network rules.
-    Implements the complete motif counting pipeline.
+    Loads all required data from pickle file in ./db directory.
     """
     
-    def __init__(self, motif_store: RuleBasedMotifStore):
+    def __init__(self, database_name: str, args):
         """
-        Initialize the motif counter with a populated motif store.
+        Initialize the motif counter by loading from pickle.
         
         Args:
-            motif_store: RuleBasedMotifStore containing all rules and data
+            database_name: Name of the database (e.g., 'cora', 'citeseer')
+            args: Arguments object containing configuration
         """
-        self.store = motif_store
-        self.args = motif_store.args
+        self.database_name = database_name
+        self.args = args
         
+        # Determine pickle path
+        db_dir = Path('./db')
+        pickle_path = db_dir / f"{database_name}.pkl"
+        
+        if not pickle_path.exists():
+            raise FileNotFoundError(
+                f"Pickle file not found: {pickle_path}\n"
+                f"Please ensure motif store has been initialized first."
+            )
+        
+        # Load all data from pickle
+        print(f"  📦 Loading motif data from: {pickle_path}")
+        self._load_from_pickle(pickle_path)
+        print(f"  ✓ Loaded {self.num_motifs} motif rules")
+    
+    def _load_from_pickle(self, pickle_path: Path):
+        """Load all required data from pickle file."""
+        with open(pickle_path, "rb") as f:
+            data = pickle.load(f)
+        
+        # Load all required attributes
+        self.entities = data["entities"]
+        self.relations = data["relations"]
+        self.keys = data["keys"]
+        self.rules = data["rules"]
+        self.indices = data["indices"]
+        self.attributes = data["attributes"]
+        self.base_indices = data["base_indices"]
+        self.mask_indices = data["mask_indices"]
+        self.sort_indices = data["sort_indices"]
+        self.stack_indices = data["stack_indices"]
+        self.values = data["values"]
+        self.prunes = data["prunes"]
+        self.functors = data["functors"]
+        self.variables = data["variables"]
+        self.nodes = data["nodes"]
+        self.states = data["states"]
+        self.masks = data["masks"]
+        self.multiples = data["multiples"]
+        self.entity_feature_columns = data.get("entity_feature_columns", {})
+        self.relation_feature_columns = data.get("relation_feature_columns", {})
+        self.feature_info_mapping = data.get("feature_info_mapping", {})
+        self.num_nodes_graph = data.get("num_nodes_graph", 0)
+        
+        # Load matrices and move to device
+        self.device = getattr(self.args, 'device', 'cuda')
+        self.matrices = {}
+        for key, matrix in data["matrices"].items():
+            if isinstance(matrix, torch.Tensor):
+                self.matrices[key] = matrix.to(self.device)
+            else:
+                self.matrices[key] = matrix
+    
+    @property
+    def num_motifs(self) -> int:
+        """Total number of motif rules."""
+        return len(self.rules)
+    
     def count(self, graph_data: Dict) -> List[float]:
         """
         Main entry point: counts all motifs in a graph.
@@ -55,11 +114,11 @@ class RelationalMotifCounter:
         labels = graph_data.get('labels', None)
         
         # Update the adjacency matrix
-        key = list(self.store.matrices.keys())[0]
-        self.store.matrices[key] = adjacency.to(self.store.device)
+        key = list(self.matrices.keys())[0]
+        self.matrices[key] = adjacency.to(self.device)
         
         # Process features
-        reconstructed_x_slice = torch.tensor(features).to(self.store.device)
+        reconstructed_x_slice = torch.tensor(features).to(self.device)
         reconstructed_labels = None
         
         return reconstructed_x_slice, reconstructed_labels
@@ -76,11 +135,11 @@ class RelationalMotifCounter:
         counter = 0
         counter_c1 = 0
         
-        for table in range(len(self.store.rules)):
-            print(self.store.rules[table])
+        for table in range(len(self.rules)):
+            print(self.rules[table])
             indexx = -1
             
-            for table_row in self.store.values[table]:
+            for table_row in self.values[table]:
                 indexx += 1
                 
                 # Compute unmasked matrices for this rule
@@ -92,20 +151,20 @@ class RelationalMotifCounter:
                 # Apply masking
                 masked_matrices = self._compute_masked_matrices(
                     unmasked_matrices, 
-                    self.store.base_indices[table], 
-                    self.store.mask_indices[table]
+                    self.base_indices[table], 
+                    self.mask_indices[table]
                 )
                 
                 # Sort matrices for multiplication
                 sorted_matrices = self._compute_sorted_matrices(
                     masked_matrices, 
-                    self.store.sort_indices[table]
+                    self.sort_indices[table]
                 )
                 
                 # Stack matrices according to dependencies
                 stacked_matrices = self._compute_stacked_matrices(
                     sorted_matrices, 
-                    self.store.stack_indices[table]
+                    self.stack_indices[table]
                 )
                 
                 # Compute final result through matrix multiplication
@@ -113,7 +172,7 @@ class RelationalMotifCounter:
                 
                 # Append result with optional weighting
                 if self.args.rule_weight:
-                    motif_list.append(torch.sum(result) * self.store.prunes[table][indexx])
+                    motif_list.append(torch.sum(result) * self.prunes[table][indexx])
                 else:
                     motif_list.append(torch.sum(result))
                 
@@ -134,27 +193,27 @@ class RelationalMotifCounter:
         """
         unmasked_matrices = []
         
-        for column in range(len(self.store.rules[table])):
-            functor = self.store.functors[table][column]
-            table_functor_value = table_row[column + self.store.multiples[table]]
+        for column in range(len(self.rules[table])):
+            functor = self.functors[table][column]
+            table_functor_value = table_row[column + self.multiples[table]]
             tuple_mask_info = ('0', '0', '0')
             variable = '0'
             functor_value_dict_key = (table_functor_value, functor, variable, tuple_mask_info)
             
             if mode == 'metric_observed':
-                if self.store.states[table][column] != 1:
+                if self.states[table][column] != 1:
                     if functor_value_dict.get(functor_value_dict_key) is not None:
                         matrix = functor_value_dict[functor_value_dict_key]
                         unmasked_matrices.append(matrix)
                         counter += 1
                         continue
             
-            state = self.store.states[table][column]
+            state = self.states[table][column]
             
             if state == 0:
                 # State 0: Unary predicates without relations
                 matrix = self._compute_state_zero(
-                    functor, table_functor_value, self.store.nodes[table][column],
+                    functor, table_functor_value, self.nodes[table][column],
                     reconstructed_x_slice, reconstructed_labels, mode
                 )
                 unmasked_matrices.append(matrix)
@@ -164,8 +223,8 @@ class RelationalMotifCounter:
             elif state == 1:
                 # State 1: Masked variables
                 matrices_list, functor_value_dict, counter, counter_c1 = self._compute_state_one(
-                    functor, table_functor_value, self.store.variables[table][column],
-                    self.store.nodes[table][column], self.store.masks[table][column],
+                    functor, table_functor_value, self.variables[table][column],
+                    self.nodes[table][column], self.masks[table][column],
                     reconstructed_x_slice, reconstructed_labels, mode,
                     functor_value_dict, counter, counter_c1
                 )
@@ -193,19 +252,19 @@ class RelationalMotifCounter:
                            reconstructed_x_slice, reconstructed_labels, mode):
         """Compute matrix for state 0 (unary predicates without relations)."""
         if mode == 'metric_observed':
-            primary_key = self.store.keys[functor_address]
-            matrix = torch.zeros((len(self.store.entities[functor_address].index), 1), 
-                               device=self.store.device)
-            for entity_index in range(len(self.store.entities[functor_address][functor])):
-                functor_value = self.store.entities[functor_address][functor][entity_index]
+            primary_key = self.keys[functor_address]
+            matrix = torch.zeros((len(self.entities[functor_address].index), 1), 
+                               device=self.device)
+            for entity_index in range(len(self.entities[functor_address][functor])):
+                functor_value = self.entities[functor_address][functor][entity_index]
                 if isinstance(table_functor_value, str):
                     if isinstance(functor_value, (np.int64, np.int32)):
                         functor_value = str(functor_value)
                     elif isinstance(functor_value, (np.float64, np.float32)):
                         functor_value = str(int(functor_value))
                 if functor_value == table_functor_value:
-                    key_index = self.store.entities[functor_address][primary_key][entity_index]
-                    row_index = self.store.indices[primary_key][key_index]
+                    key_index = self.entities[functor_address][primary_key][entity_index]
+                    row_index = self.indices[primary_key][key_index]
                     matrix[row_index][0] = 1
         else:
             found = False
@@ -213,7 +272,7 @@ class RelationalMotifCounter:
             entity_or_relation_key = None
             
             # Search in entity feature columns
-            for key, feature_list in self.store.entity_feature_columns.items():
+            for key, feature_list in self.entity_feature_columns.items():
                 if functor in feature_list:
                     indx = feature_list.index(functor)
                     entity_or_relation_key = key
@@ -222,7 +281,7 @@ class RelationalMotifCounter:
             
             # Search in relation feature columns if not found
             if not found:
-                for key, feature_list in self.store.relation_feature_columns.items():
+                for key, feature_list in self.relation_feature_columns.items():
                     if functor in feature_list:
                         indx = feature_list.index(functor)
                         entity_or_relation_key = key
@@ -241,7 +300,7 @@ class RelationalMotifCounter:
                 else:
                     print("here")
             else:
-                matrix = reconstructed_labels[:, int(table_functor_value)].float().view(-1, 1).to(self.store.device)
+                matrix = reconstructed_labels[:, int(table_functor_value)].float().view(-1, 1).to(self.device)
         
         return matrix
     
@@ -250,7 +309,7 @@ class RelationalMotifCounter:
                           counter, counter_c1):
         """Compute matrices for state 1 (masked variables)."""
         matrices_list = []
-        primary_key = self.store.keys[functor_address]
+        primary_key = self.keys[functor_address]
         
         for mask_info in masks_list:
             tuple_mask_info = tuple(mask_info)
@@ -266,17 +325,17 @@ class RelationalMotifCounter:
                 
                 # Create vector or matrix based on variable position
                 if variable == mask_info[1]:
-                    matrix = torch.zeros((self.store.matrices[mask_info[0]].shape[0], 1), 
-                                       device=self.store.device)
+                    matrix = torch.zeros((self.matrices[mask_info[0]].shape[0], 1), 
+                                       device=self.device)
                 else:
-                    matrix = torch.zeros((1, self.store.matrices[mask_info[0]].shape[1]), 
-                                       device=self.store.device)
+                    matrix = torch.zeros((1, self.matrices[mask_info[0]].shape[1]), 
+                                       device=self.device)
                 
-                for entity_index in range(len(self.store.entities[functor_address][functor])):
-                    functor_value = self.store.entities[functor_address][functor][entity_index]
+                for entity_index in range(len(self.entities[functor_address][functor])):
+                    functor_value = self.entities[functor_address][functor][entity_index]
                     if functor_value == table_functor_value:
-                        key_index = self.store.entities[functor_address][primary_key][entity_index]
-                        index = self.store.indices[primary_key][key_index]
+                        key_index = self.entities[functor_address][primary_key][entity_index]
+                        index = self.indices[primary_key][key_index]
                         if variable == mask_info[1]:
                             matrix[index, 0] = 1
                         else:
@@ -309,7 +368,7 @@ class RelationalMotifCounter:
         entity_or_relation_key = None
         
         # Search in entity feature columns
-        for key, feature_list in self.store.entity_feature_columns.items():
+        for key, feature_list in self.entity_feature_columns.items():
             if functor in feature_list:
                 indx = feature_list.index(functor)
                 entity_or_relation_key = key
@@ -318,7 +377,7 @@ class RelationalMotifCounter:
         
         # Search in relation feature columns if not found
         if not found:
-            for key, feature_list in self.store.relation_feature_columns.items():
+            for key, feature_list in self.relation_feature_columns.items():
                 if functor in feature_list:
                     indx = feature_list.index(functor)
                     entity_or_relation_key = key
@@ -349,7 +408,7 @@ class RelationalMotifCounter:
         entity_or_relation_key = None
         
         # Search in entity feature columns
-        for key, feature_list in self.store.entity_feature_columns.items():
+        for key, feature_list in self.entity_feature_columns.items():
             if functor in feature_list:
                 indx = feature_list.index(functor)
                 entity_or_relation_key = key
@@ -358,7 +417,7 @@ class RelationalMotifCounter:
         
         # Search in relation feature columns if not found
         if not found:
-            for key, feature_list in self.store.relation_feature_columns.items():
+            for key, feature_list in self.relation_feature_columns.items():
                 if functor in feature_list:
                     indx = feature_list.index(functor)
                     entity_or_relation_key = key
@@ -377,7 +436,7 @@ class RelationalMotifCounter:
             else:
                 print("fix here")
         else:
-            matrix = reconstructed_labels[:, int(table_functor_value)].view(1, -1).to(self.store.device)
+            matrix = reconstructed_labels[:, int(table_functor_value)].view(1, -1).to(self.device)
         
         return matrix
     
@@ -385,9 +444,9 @@ class RelationalMotifCounter:
         """Retrieve or invert the relation matrix for state 2."""
         if table_functor_value == 'F':
             # Invert matrix if value is 'F' (false)
-            matrix = 1 - self.store.matrices[functor]
+            matrix = 1 - self.matrices[functor]
         else:
-            matrix = self.store.matrices[functor]
+            matrix = self.matrices[functor]
         return matrix
     
     def _compute_state_three(self, reconstructed_labels, functor, table_functor_value):
@@ -395,24 +454,24 @@ class RelationalMotifCounter:
         mode = False
         
         if mode == True:
-            table_name = self.store.attributes[functor]
-            primary_key = self.store.keys[table_name]
+            table_name = self.attributes[functor]
+            primary_key = self.keys[table_name]
             
             if table_functor_value == 'N/A':
-                matrix = 1 - self.store.matrices[table_name]
+                matrix = 1 - self.matrices[table_name]
             else:
-                matrix = torch.zeros_like(self.store.matrices[table_name], device=self.store.device)
-                for index_relation in range(len(self.store.relations[table_name][functor])):
-                    functor_value = self.store.relations[table_name][functor][index_relation]
+                matrix = torch.zeros_like(self.matrices[table_name], device=self.device)
+                for index_relation in range(len(self.relations[table_name][functor])):
+                    functor_value = self.relations[table_name][functor][index_relation]
                     if functor_value == table_functor_value:
-                        pk0_value = self.store.relations[table_name][primary_key[0]][index_relation]
-                        pk1_value = self.store.relations[table_name][primary_key[1]][index_relation]
-                        index1 = self.store.indices[primary_key[0]][pk0_value]
-                        index2 = self.store.indices[primary_key[1]][pk1_value]
+                        pk0_value = self.relations[table_name][primary_key[0]][index_relation]
+                        pk1_value = self.relations[table_name][primary_key[1]][index_relation]
+                        index1 = self.indices[primary_key[0]][pk0_value]
+                        index2 = self.indices[primary_key[1]][pk1_value]
                         matrix[index1, index2] = 1
         else:
             feature_idx = None
-            for idx, info in self.store.feature_info_mapping.items():
+            for idx, info in self.feature_info_mapping.items():
                 if info['feature_name'] == functor:
                     feature_idx = idx
                     break
@@ -422,7 +481,7 @@ class RelationalMotifCounter:
             if table_functor_value == 'N/A':
                 matrix = torch.sum(target_tensor, dim=0)
             else:
-                value_mapping = self.store.feature_info_mapping[feature_idx]['value_index_mapping']
+                value_mapping = self.feature_info_mapping[feature_idx]['value_index_mapping']
                 reverse_mapping = {v: k for k, v in value_mapping.items()}
                 value_idx = reverse_mapping[int(table_functor_value)]
                 matrix = target_tensor[value_idx]
@@ -468,7 +527,7 @@ class RelationalMotifCounter:
             # Element-wise multiplication with identity
             stacked_matrices[k[0]] = torch.mul(
                 stacked_matrices[k[0]],
-                torch.eye(len(stacked_matrices[k[0]]), device=self.store.device)
+                torch.eye(len(stacked_matrices[k[0]]), device=self.device)
             )
         
         return stacked_matrices

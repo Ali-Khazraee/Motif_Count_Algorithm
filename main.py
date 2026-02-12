@@ -105,9 +105,7 @@ def main():
             database_name=args.database_name,
             args=args
         )
-        print(f"  ✓ Loaded {motif_store.num_motifs} motif rules")
-        print(f"  ✓ {len(motif_store.entities)} entity tables")
-        print(f"  ✓ {len(motif_store.relations)} relation tables")
+
     except Exception as e:
         print(f"\n✗ Error initializing motif store: {e}")
         return

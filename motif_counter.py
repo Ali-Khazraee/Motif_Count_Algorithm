@@ -137,49 +137,18 @@ class RelationalMotifCounter:
         
         for table in range(len(self.rules)):
             print(self.rules[table])
-            indexx = -1
             
-            for table_row in self.values[table]:
-                indexx += 1
-                
-                # Compute unmasked matrices for this rule
-                unmasked_matrices, functor_value_dict, counter, counter_c1 = self._compute_unmasked_matrices(
-                    table, table_row, reconstructed_x_slice, reconstructed_labels, mode,
+            for indexx, table_row in enumerate(self.values[table]):
+                # Count motif for this specific rule-value combination
+                count, functor_value_dict, counter, counter_c1 = self._count_single_rule_value(
+                    table, indexx, table_row, 
+                    reconstructed_x_slice, reconstructed_labels, mode,
                     functor_value_dict, counter, counter_c1
                 )
                 
-                # Apply masking
-                masked_matrices = self._compute_masked_matrices(
-                    unmasked_matrices, 
-                    self.base_indices[table], 
-                    self.mask_indices[table]
-                )
-                
-                # Sort matrices for multiplication
-                sorted_matrices = self._compute_sorted_matrices(
-                    masked_matrices, 
-                    self.sort_indices[table]
-                )
-                
-                # Stack matrices according to dependencies
-                stacked_matrices = self._compute_stacked_matrices(
-                    sorted_matrices, 
-                    self.stack_indices[table]
-                )
-                
-                # Compute final result through matrix multiplication
-                result = self._compute_result(stacked_matrices)
-                
-                # Append result with optional weighting
-                if self.args.rule_weight:
-                    motif_list.append(torch.sum(result) * self.prunes[table][indexx])
-                else:
-                    motif_list.append(torch.sum(result))
-                
-                print(torch.sum(result))
-                
-                # Cleanup to free memory
-                del unmasked_matrices, masked_matrices, sorted_matrices, stacked_matrices, result
+                # Append the count to motif list
+                motif_list.append(count)
+                print(count)
         
         return motif_list
     
@@ -540,3 +509,48 @@ class RelationalMotifCounter:
             result = torch.mm(result, stacked_matrices[k])
         
         return result
+
+
+
+    def _count_single_rule_value(self, table: int, indexx: int, table_row,
+                                 reconstructed_x_slice, reconstructed_labels, mode: str,
+                                 functor_value_dict: dict, counter: int, counter_c1: int):
+
+        # Compute unmasked matrices for this rule
+        unmasked_matrices, functor_value_dict, counter, counter_c1 = self._compute_unmasked_matrices(
+            table, table_row, reconstructed_x_slice, reconstructed_labels, mode,
+            functor_value_dict, counter, counter_c1
+        )
+        
+        # Apply masking
+        masked_matrices = self._compute_masked_matrices(
+            unmasked_matrices, 
+            self.base_indices[table], 
+            self.mask_indices[table]
+        )
+        
+        # Sort matrices for multiplication
+        sorted_matrices = self._compute_sorted_matrices(
+            masked_matrices, 
+            self.sort_indices[table]
+        )
+        
+        # Stack matrices according to dependencies
+        stacked_matrices = self._compute_stacked_matrices(
+            sorted_matrices, 
+            self.stack_indices[table]
+        )
+        
+        # Compute final result through matrix multiplication
+        result = self._compute_result(stacked_matrices)
+        
+        # Calculate count with optional weighting
+        if self.args.rule_weight:
+            count = torch.sum(result) * self.prunes[table][indexx]
+        else:
+            count = torch.sum(result)
+        
+        # Cleanup to free memory
+        del unmasked_matrices, masked_matrices, sorted_matrices, stacked_matrices, result
+        
+        return count, functor_value_dict, counter, counter_c1

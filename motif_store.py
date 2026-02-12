@@ -50,7 +50,6 @@ class RuleBasedMotifStore:
         # Load or create motif data
         if self.pickle_path.exists():
             print(f"  📦 Found existing pickle: {self.pickle_path}")
-            self._load_from_pickle()
         else:
             print(f"  🗄️  No pickle found, reading from database...")
             self._read_from_database()
@@ -99,46 +98,6 @@ class RuleBasedMotifStore:
         """Total number of motif rules."""
         return len(self.rules)
     
-    def _load_from_pickle(self):
-        """Load all data from pickle file."""
-        print(f"  ⏳ Loading from pickle...")
-        
-        with open(self.pickle_path, "rb") as f:
-            data = pickle.load(f)
-        
-        # Restore all attributes
-        self.entities = data["entities"]
-        self.relations = data["relations"]
-        self.keys = data["keys"]
-        self.rules = data["rules"]
-        self.indices = data["indices"]
-        self.attributes = data["attributes"]
-        self.base_indices = data["base_indices"]
-        self.mask_indices = data["mask_indices"]
-        self.sort_indices = data["sort_indices"]
-        self.stack_indices = data["stack_indices"]
-        self.values = data["values"]
-        self.prunes = data["prunes"]
-        self.functors = data["functors"]
-        self.variables = data["variables"]
-        self.nodes = data["nodes"]
-        self.states = data["states"]
-        self.masks = data["masks"]
-        self.multiples = data["multiples"]
-        self.entity_feature_columns = data.get("entity_feature_columns", {})
-        self.relation_feature_columns = data.get("relation_feature_columns", {})
-        self.feature_info_mapping = data.get("feature_info_mapping", {})
-        self.num_nodes_graph = data.get("num_nodes_graph", 0)
-        
-        # Load matrices and move to device
-        self.matrices = {}
-        for key, matrix in data["matrices"].items():
-            if isinstance(matrix, torch.Tensor):
-                self.matrices[key] = matrix.to(self.device)
-            else:
-                self.matrices[key] = matrix
-        
-        print(f"  ✓ Loaded {self.num_motifs} rules from pickle")
     
     def _save_to_pickle(self):
         """Save all data to pickle file."""

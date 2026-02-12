@@ -166,3 +166,19 @@ class DataLoader:
             'test_mask': self.test_mask,
             'important_feature_indices': self.important_feature_indices
         }
+    
+    def get_graph_data_list(self) -> list:
+        """
+        Get graph data formatted for motif counting as a list.
+        
+        Returns:
+            List containing graph_data dictionaries ready for motif counting.
+            Currently returns a single-item list, but structured for future expansion.
+        """
+        graph_data = {
+            'adjacency_matrix': self.adjacency_matrix,
+            'features': self.features,  # Already reduced with labels
+            'labels': None
+        }
+        
+        return [graph_data]

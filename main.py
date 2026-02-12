@@ -105,23 +105,35 @@ def main():
             args=args
         )
         
-        # Prepare graph data for counting
-        graph_data = {
-            'adjacency_matrix': data['adjacency_matrix'],
-            'features': data['features'],  # Already reduced with labels
-            'labels': None
-        }
+        # Get graph data list from DataLoader
+        graph_data_list = data_loader.get_graph_data_list()
         
         print("\n" + "="*60)
         print("Performing motif counting...")
         print("="*60)
+        print(f"Processing {len(graph_data_list)} graph(s)...")
         
-        motif_counts = motif_counter.count(graph_data)
+        # Loop through each graph in the list
+        all_motif_counts = []
+        for idx, graph_data in enumerate(graph_data_list):
+            print(f"\n--- Processing graph {idx + 1}/{len(graph_data_list)} ---")
+            motif_counts = motif_counter.count(graph_data)
+            all_motif_counts.append(motif_counts)
+            print(f"Graph {idx + 1}: {len(motif_counts)} motif values counted")
+        
+        # Aggregate motif counts across all graphs
+        print("\nAggregating motif counts across all graphs...")
+        aggregated_counts = motif_counter.aggregate_motif_counts(all_motif_counts)
+        
+        # Display rules with their aggregated motif counts
+        motif_counter.display_rules_and_motifs(aggregated_counts)
         
         print("\n" + "="*60)
         print("Pipeline completed successfully!")
         print("="*60)
-        print(f"Total motifs counted: {len(motif_counts)}")
+        print(f"Total graphs processed: {len(graph_data_list)}")
+        print(f"Total unique rules: {len(motif_counter.rules)}")
+        print(f"Total motif values: {len(aggregated_counts)}")
         
     except Exception as e:
         print(f"\n✗ Error during motif counting: {e}")

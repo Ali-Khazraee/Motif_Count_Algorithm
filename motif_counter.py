@@ -136,7 +136,7 @@ class RelationalMotifCounter:
         counter_c1 = 0
         
         for table in range(len(self.rules)):
-            print(self.rules[table])
+            # print(self.rules[table])
             
             for indexx, table_row in enumerate(self.values[table]):
                 # Count motif for this specific rule-value combination
@@ -148,9 +148,81 @@ class RelationalMotifCounter:
                 
                 # Append the count to motif list
                 motif_list.append(count)
-                print(count)
+                # print(count)
         
         return motif_list
+    
+    def get_rule_motif_mapping(self) -> List[Tuple[int, int]]:
+        """
+        Get mapping of how many motif counts belong to each rule.
+        
+        Returns:
+            List of tuples (rule_index, num_values) indicating how many
+            motif counts in the final list correspond to each rule.
+        """
+        mapping = []
+        for rule_idx in range(len(self.rules)):
+            num_values = len(self.values[rule_idx])
+            mapping.append((rule_idx, num_values))
+        return mapping
+    
+    def aggregate_motif_counts(self, all_motif_counts: List[List]) -> List[float]:
+        """
+        Aggregate motif counts across multiple graphs by summing same indices.
+        
+        Args:
+            all_motif_counts: List of motif count lists, one per graph
+                             e.g., [[graph1_counts], [graph2_counts], ...]
+        
+        Returns:
+            Single list with aggregated counts (sum across all graphs)
+        """
+        if len(all_motif_counts) == 0:
+            return []
+        
+        # Convert tensors to floats if needed
+        num_motifs = len(all_motif_counts[0])
+        aggregated = [0.0] * num_motifs
+        
+        for graph_counts in all_motif_counts:
+            for idx, count in enumerate(graph_counts):
+                # Handle torch tensors
+                if isinstance(count, torch.Tensor):
+                    count = count.item()
+                aggregated[idx] += count
+        
+        return aggregated
+    
+    def display_rules_and_motifs(self, aggregated_counts: List[float]):
+        """
+        Display rules with their corresponding aggregated motif counts.
+        
+        Args:
+            aggregated_counts: List of aggregated motif counts
+        """
+        print("\n" + "="*80)
+        print("RULES AND MOTIF COUNTS")
+        print("="*80)
+        
+        count_idx = 0
+        for rule_idx in range(len(self.rules)):
+            rule = self.rules[rule_idx]
+            num_values = len(self.values[rule_idx])
+            
+            print(f"\nRule {rule_idx + 1}: {rule}")
+            print("-" * 80)
+            
+            # Display all motif counts for this rule
+            for value_idx in range(num_values):
+                count = aggregated_counts[count_idx]
+                print(f"  Value {value_idx + 1}/{num_values}: {count:.4f}")
+                count_idx += 1
+            
+
+        
+        print("\n" + "="*80)
+        print(f"Grand Total: {sum(aggregated_counts):.4f}")
+        print("="*80)
     
     def _compute_unmasked_matrices(self, table, table_row, reconstructed_x_slice, 
                                    reconstructed_labels, mode, functor_value_dict, 

@@ -35,6 +35,10 @@ def parse_arguments():
     parser.add_argument('--test_local_mults', type=bool, default=True,
                        help='Enable validation of motif count number against FactorBase outputs')
     
+    # Interactive mode
+    parser.add_argument('--interactive', action='store_true', default=False,
+                       help='Enable interactive mode to select specific rules and values to count')
+    
     # Device configuration
     parser.add_argument('--device', type=str, default='cuda',
                        choices=['cuda', 'cpu'],
@@ -75,6 +79,7 @@ def main():
     print(f"  Dataset: {args.dataset}")
     print(f"  Graph type: {args.graph_type}")
     print(f"  Device: {args.device}")
+    print(f"  Interactive mode: {args.interactive}")
     
     # ========== Step 1: Load Graph Data ==========
     print("\n[Step 1/3] Loading and preprocessing graph data...")
@@ -115,9 +120,19 @@ def main():
         
         # Loop through each graph in the list
         all_motif_counts = []
+        selected_rules_values = None  # Will be set in interactive mode
+        
         for idx, graph_data in enumerate(graph_data_list):
             print(f"\n--- Processing graph {idx + 1}/{len(graph_data_list)} ---")
-            motif_counts = motif_counter.count(graph_data)
+            
+            if args.interactive:
+                # Interactive mode returns tuple: (motif_counts, selected_rules_values)
+                result = motif_counter.count(graph_data, interactive=True)
+                motif_counts, selected_rules_values = result
+            else:
+                # Normal mode returns just motif_counts
+                motif_counts = motif_counter.count(graph_data, interactive=False)
+            
             all_motif_counts.append(motif_counts)
             print(f"Graph {idx + 1}: {len(motif_counts)} motif values counted")
         
@@ -126,7 +141,7 @@ def main():
         aggregated_counts = motif_counter.aggregate_motif_counts(all_motif_counts)
         
         # Display rules with their aggregated motif counts
-        motif_counter.display_rules_and_motifs(aggregated_counts)
+        motif_counter.display_rules_and_motifs(aggregated_counts, selected_rules_values)
         
         print("\n" + "="*60)
         print("Pipeline completed successfully!")

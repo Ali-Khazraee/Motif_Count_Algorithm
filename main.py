@@ -6,7 +6,6 @@ import random
 import argparse
 
 from data import DataLoader
-from ds_to_db import reduce_node_features
 from motif_store import RuleBasedMotifStore
 from motif_counter import RelationalMotifCounter
 
@@ -78,28 +77,16 @@ def main():
     print(f"  Device: {args.device}")
     
     # ========== Step 1: Load Graph Data ==========
-    print("\n[Step 1/4] Loading graph data...")
-    data_loader = DataLoader()
+    print("\n[Step 1/3] Loading and preprocessing graph data...")
+    data_loader = DataLoader(n_components=5, random_seed=0)
     data_loader.load_data()
     data = data_loader.get_data()
     print(f"  ✓ Loaded {data['num_nodes']} nodes, {len(data['edges'])} edges")
+    print(f"  ✓ Reduced to {data['num_features']} features (including label)")
     
-    # ========== Step 2: Feature Reduction ==========
-    print("\n[Step 2/4] Reducing features...")
-    x_reduced, important_feats = reduce_node_features(
-        data['features'], 
-        data['labels'], 
-        random_seed=0, 
-        n_components=5
-    )
-    
-    labels_column = data['labels'].numpy().reshape(-1, 1)
-    x_with_labels = np.concatenate([x_reduced, labels_column], axis=1)
-    print(f"  ✓ Reduced to {x_with_labels.shape[1]} features (including label)")
-    
-    # ========== Step 3: Initialize Motif Store ==========
+    # ========== Step 2: Initialize Motif Store ==========
     # This automatically handles pickle load/save
-    print(f"\n[Step 3/4] Initializing motif store...")
+    print(f"\n[Step 2/3] Initializing motif store...")
     try:
         motif_store = RuleBasedMotifStore(
             database_name=args.database_name,
@@ -110,8 +97,8 @@ def main():
         print(f"\n✗ Error initializing motif store: {e}")
         return
     
-    # ========== Step 4: Count Motifs ==========
-    print("\n[Step 4/4] Counting motifs...")
+    # ========== Step 3: Count Motifs ==========
+    print("\n[Step 3/3] Counting motifs...")
     try:
         motif_counter = RelationalMotifCounter(
             database_name=args.database_name,
@@ -121,7 +108,7 @@ def main():
         # Prepare graph data for counting
         graph_data = {
             'adjacency_matrix': data['adjacency_matrix'],
-            'features': x_with_labels,
+            'features': data['features'],  # Already reduced with labels
             'labels': None
         }
         

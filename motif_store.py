@@ -287,27 +287,27 @@ class RuleBasedMotifStore:
             entity1 = reference[0][0]
             entity2 = reference[1][0]
             
-            shape = (len(self.entities[entity1].index), len(self.entities[entity2].index))
+            shape = (10, 10)
             self.matrices[table_name] = torch.zeros(shape, dtype=torch.float32, device=self.device)
         
         # Populate matrices
-        for table_name, df in self.relations.items():
-            cursor_setup.execute("SELECT COLUMN_NAME FROM ForeignKeyColumns WHERE TABLE_NAME = %s", (table_name,))
-            key = cursor_setup.fetchall()
-            cursor_setup.execute("SELECT COLUMN_NAME, REFERENCED_COLUMN_NAME FROM ForeignKeyColumns WHERE TABLE_NAME = %s", (table_name,))
-            reference = cursor_setup.fetchall()
+        # for table_name, df in self.relations.items():
+        #     cursor_setup.execute("SELECT COLUMN_NAME FROM ForeignKeyColumns WHERE TABLE_NAME = %s", (table_name,))
+        #     key = cursor_setup.fetchall()
+        #     cursor_setup.execute("SELECT COLUMN_NAME, REFERENCED_COLUMN_NAME FROM ForeignKeyColumns WHERE TABLE_NAME = %s", (table_name,))
+        #     reference = cursor_setup.fetchall()
             
-            rows_indices = []
-            cols_indices = []
-            for index, row in df.iterrows():
-                row_index = self.indices[reference[0][1]][row[key[0][0]]]
-                col_index = self.indices[reference[1][1]][row[key[1][0]]]
-                rows_indices.append(row_index)
-                cols_indices.append(col_index)
+        #     rows_indices = []
+        #     cols_indices = []
+        #     for index, row in df.iterrows():
+        #         row_index = self.indices[reference[0][1]][row[key[0][0]]]
+        #         col_index = self.indices[reference[1][1]][row[key[1][0]]]
+        #         rows_indices.append(row_index)
+        #         cols_indices.append(col_index)
             
-            rows_indices_tensor = torch.tensor(rows_indices, dtype=torch.long)
-            cols_indices_tensor = torch.tensor(cols_indices, dtype=torch.long)
-            self.matrices[table_name][rows_indices_tensor, cols_indices_tensor] = 1
+        #     rows_indices_tensor = torch.tensor(rows_indices, dtype=torch.long)
+        #     cols_indices_tensor = torch.tensor(cols_indices, dtype=torch.long)
+        #     self.matrices[table_name][rows_indices_tensor, cols_indices_tensor] = 1
     
     def _process_rules(self, bn_conn, setup_conn):
         """Process rules from Bayesian Network and prepare for counting."""

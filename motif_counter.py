@@ -82,7 +82,29 @@ class RelationalMotifCounter:
         """Total number of motif rules."""
         return len(self.rules)
     
-    def count(self, graph_data: Dict, interactive: bool = False):
+    def do_interactive_selection(self) -> Dict:
+        """
+        Perform interactive rule and value selection WITHOUT counting.
+        This is used when processing multiple graphs to ask questions only once.
+        
+        Returns:
+            Dictionary containing selected rules and their value combinations
+        """
+        print("\n" + "="*80)
+        print("INTERACTIVE RULE SELECTION")
+        print("="*80)
+        print("(This selection will be applied to all graphs)")
+        print("="*80 + "\n")
+        
+        selected_rules_values = self._interactive_rule_selection()
+        
+        print("\n" + "="*80)
+        print("✓ Selection complete! This will be applied to all graphs.")
+        print("="*80)
+        
+        return selected_rules_values
+    
+    def count(self, graph_data: Dict, interactive: bool = False, selected_rules_values: Dict = None):
         """
         Main entry point: counts all motifs in a graph.
         
@@ -91,17 +113,28 @@ class RelationalMotifCounter:
                 - 'adjacency_matrix': Adjacency tensor
                 - 'features': Node features
                 - 'labels': Node labels (optional)
-            interactive: If True, ask user which rules/values to count
+            interactive: If True, ask user which rules/values to count (ignored if selected_rules_values provided)
+            selected_rules_values: Pre-selected rules/values (from do_interactive_selection)
                 
         Returns:
-            If interactive=False: List[float] - motif counts
-            If interactive=True: Tuple[List[float], Dict] - (motif counts, selected_rules_values)
+            If interactive=False or selected_rules_values provided: List[float] - motif counts
+            If interactive=True and no selected_rules_values: Tuple[List[float], Dict] - (motif counts, selected_rules_values)
         """
         # Process and update graph data
         reconstructed_x_slice, reconstructed_labels = self._process_graph_data(graph_data)
         
-        if interactive:
-            # Interactive mode: user selects rules and values
+        # Case 1: Use provided selection (from do_interactive_selection)
+        if selected_rules_values is not None:
+            motif_counts = self._iteration_function_selective(
+                reconstructed_x_slice, 
+                reconstructed_labels, 
+                mode="test",
+                selected_rules_values=selected_rules_values
+            )
+            return motif_counts
+        
+        # Case 2: Interactive mode - do selection for this graph only
+        elif interactive:
             selected_rules_values = self._interactive_rule_selection()
             motif_counts = self._iteration_function_selective(
                 reconstructed_x_slice, 
@@ -110,8 +143,9 @@ class RelationalMotifCounter:
                 selected_rules_values=selected_rules_values
             )
             return motif_counts, selected_rules_values
+        
+        # Case 3: Default mode - count all rules and values
         else:
-            # Default mode: count all rules and values
             motif_counts = self._iteration_function(
                 reconstructed_x_slice, 
                 reconstructed_labels, 
@@ -130,8 +164,13 @@ class RelationalMotifCounter:
         self.matrices[key] = adjacency.to(self.device)
         
         # Process features
-        reconstructed_x_slice = torch.tensor(features).to(self.device)
-        reconstructed_labels = None
+        if torch.is_tensor(features):
+            reconstructed_x_slice = features.to(self.device)
+        else:
+            reconstructed_x_slice = torch.tensor(features).to(self.device)
+        
+        # Process labels (edge features for QM9, None for Cora)
+        reconstructed_labels = labels
         
         return reconstructed_x_slice, reconstructed_labels
     
@@ -524,8 +563,8 @@ class RelationalMotifCounter:
                 count_idx += 1
             
             # Calculate total for this rule
-            # rule_total = sum(aggregated_counts[count_idx - num_values:count_idx])
-            # print(f"  → Rule Total: {rule_total:.4f}")
+        #     rule_total = sum(aggregated_counts[count_idx - num_values:count_idx])
+        #     print(f"  → Rule Total: {rule_total:.4f}")
         
         # print("\n" + "="*80)
         # print(f"Grand Total: {sum(aggregated_counts):.4f}")
@@ -562,7 +601,7 @@ class RelationalMotifCounter:
                 rule_counts.append(count)
                 count_idx += 1
             
-            # Calculate total for this rule
+            # # Calculate total for this rule
             # rule_total = sum(rule_counts)
             # print(f"  → Rule Total: {rule_total:.4f}")
         

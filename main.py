@@ -14,12 +14,16 @@ def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Motif Count')
     
-    # Database configuration
-    parser.add_argument('--database_name', type=str, default='cora',
-                    help='Name of the database to use (e.g., cora, citeseer, imdb)')
+    # Dataset selection
+    parser.add_argument('--dataset_type', type=str, default='qm9',
+                       choices=['cora', 'qm9'],
+                       help='Dataset to use: cora or qm9')
+    parser.add_argument('--max_graphs', type=int, default=None,
+                       help='Maximum number of graphs to load (QM9 only, default: all)')
     
-    parser.add_argument('-dataset', dest="dataset", default="Cora_dgl",
-                       help="Dataset name for display purposes")
+    # Database configuration
+    parser.add_argument('--database_name', type=str, default='qm9',
+                    help='Name of the database to use (default: same as dataset_type)')
 
     parser.add_argument('--graph_type', type=str, default='homogeneous',
                        choices=['homogeneous', 'heterogeneous'],
@@ -36,7 +40,7 @@ def parse_arguments():
                        help='Enable validation of motif count number against FactorBase outputs')
     
     # Interactive mode
-    parser.add_argument('--interactive', action='store_true', default=False,
+    parser.add_argument('--interactive', action='store_true', default=True,
                        help='Enable interactive mode to select specific rules and values to count')
     
     # Device configuration
@@ -74,20 +78,40 @@ def main():
     args = parse_arguments()
     set_random_seeds(seed=0)
     
+    # Default database_name to dataset_type if not specified
+    if args.database_name is None:
+        args.database_name = args.dataset_type
+    
     print(f"\nConfiguration:")
+    print(f"  Dataset: {args.dataset_type}")
     print(f"  Database: {args.database_name}")
-    print(f"  Dataset: {args.dataset}")
     print(f"  Graph type: {args.graph_type}")
     print(f"  Device: {args.device}")
     print(f"  Interactive mode: {args.interactive}")
+    if args.dataset_type == 'qm9' and args.max_graphs:
+        print(f"  Max graphs: {args.max_graphs}")
     
     # ========== Step 1: Load Graph Data ==========
     print("\n[Step 1/3] Loading and preprocessing graph data...")
-    data_loader = DataLoader(n_components=5, random_seed=0)
+    data_loader = DataLoader(
+        dataset_type=args.dataset_type,
+        n_components=5, 
+        random_seed=0,
+        max_graphs=args.max_graphs,
+        device=args.device
+    )
     data_loader.load_data()
     data = data_loader.get_data()
-    print(f"  ✓ Loaded {data['num_nodes']} nodes, {len(data['edges'])} edges")
-    print(f"  ✓ Reduced to {data['num_features']} features (including label)")
+    
+    if args.dataset_type == 'cora':
+        if data['num_nodes']:
+            print(f"  ✓ Loaded {data['num_nodes']} nodes, {len(data['edges']) if data['edges'] is not None else 'N/A'} edges")
+        if data['num_features']:
+            print(f"  ✓ Features: {data['num_features']} (including label)")
+    elif args.dataset_type == 'qm9':
+        print(f"  ✓ Loaded {data['num_graphs']} molecules")
+        if data['feature_info_mapping']:
+            print(f"  ✓ Feature info mapping ready")
     
     # ========== Step 2: Initialize Motif Store ==========
     # This automatically handles pickle load/save
@@ -118,17 +142,29 @@ def main():
         print("="*60)
         print(f"Processing {len(graph_data_list)} graph(s)...")
         
+        # Interactive mode: do selection once for all graphs
+        selected_rules_values = None
+        if args.interactive:
+            if len(graph_data_list) > 1:
+                print(f"\n📋 Multiple graphs detected ({len(graph_data_list)} graphs)")
+                print("   You will be asked to select rules ONCE, then applied to all graphs.\n")
+                selected_rules_values = motif_counter.do_interactive_selection()
+            # For single graph, selection happens inside count() as before
+        
         # Loop through each graph in the list
         all_motif_counts = []
-        selected_rules_values = None  # Will be set in interactive mode
         
         for idx, graph_data in enumerate(graph_data_list):
             print(f"\n--- Processing graph {idx + 1}/{len(graph_data_list)} ---")
             
             if args.interactive:
-                # Interactive mode returns tuple: (motif_counts, selected_rules_values)
-                result = motif_counter.count(graph_data, interactive=True)
-                motif_counts, selected_rules_values = result
+                if selected_rules_values is not None:
+                    # Multi-graph: use pre-selected rules/values
+                    motif_counts = motif_counter.count(graph_data, selected_rules_values=selected_rules_values)
+                else:
+                    # Single graph: do interactive selection
+                    result = motif_counter.count(graph_data, interactive=True)
+                    motif_counts, selected_rules_values = result
             else:
                 # Normal mode returns just motif_counts
                 motif_counts = motif_counter.count(graph_data, interactive=False)

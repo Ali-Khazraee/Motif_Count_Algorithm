@@ -2,3 +2,6 @@ __pycache__/
 db/
 processed_data/
 data/preprocessed_data/
+output.txt
+preprocessed_data/
+data/

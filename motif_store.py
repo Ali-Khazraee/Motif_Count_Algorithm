@@ -61,8 +61,12 @@ class RuleBasedMotifStore:
         self.rules: List = []
         self.multiples: List = []
         self.states: List = []
-        self.values: List = []
-        self.prunes: List = []
+        self.values: List = []          # points at full or pruned depending on context
+
+        # Both value sets stored in pickle so rule_prune can be toggled without
+        # deleting the cache.
+        self.values_full:   List = []   # all rows (rule_prune=False)
+        self.values_pruned: List = []   # statistically significant rows (rule_prune=True)
         
         # Structural metadata for rules
         self.functors: Dict = {}
@@ -124,8 +128,9 @@ class RuleBasedMotifStore:
             "mask_indices": self.mask_indices,
             "sort_indices": self.sort_indices,
             "stack_indices": self.stack_indices,
-            "values": self.values,
-            "prunes": self.prunes,
+            # Both value sets — motif_counter selects at load time based on --rule_prune
+            "values_full":   self.values_full,
+            "values_pruned": self.values_pruned,
             "functors": self.functors,
             "variables": self.variables,
             "nodes": self.nodes,
@@ -396,39 +401,35 @@ class RuleBasedMotifStore:
             
             cursor_bn.execute(f"SELECT * FROM `{childs[i][0]}_CP`")
             value = cursor_bn.fetchall()
-            
-            if self.args.rule_prune and not self.args.rule_weight:
-                pruned_value = []
-                for j in value:
-                    size = len(j)
+
+            # Remove N/A rows regardless of pruning setting.
+            value = [row for row in value if 'N/A' not in row]
+
+            # ── Always compute BOTH value sets so a single pickle works
+            # for either value of --rule_prune without deleting the cache.
+
+            # Full (unpruned) — rule_prune=False
+            self.values_full.append(value)
+
+            # Pruned — rule_prune=True: keep only statistically significant rows
+            pruned_value = []
+            for j in value:
+                size = len(j)
+                try:
                     if self.multiples[i]:
-                        if 2 * j[size - 4] * (log(j[size - 3]) - log(j[size - 1])) - log(j[size - 4]) > 0:
+                        if 2 * j[size-4] * (log(j[size-3]) - log(j[size-1])) - log(j[size-4]) > 0:
                             pruned_value.append(j)
                     else:
-                        if 2 * int(j[size - 3]) * (log(j[size - 5]) - log(j[size - 1])) - log(int(j[size - 3])) > 0:
+                        if 2 * int(j[size-3]) * (log(j[size-5]) - log(j[size-1])) - log(int(j[size-3])) > 0:
                             pruned_value.append(j)
-                self.values.append(pruned_value)
-            elif self.args.rule_prune and self.args.rule_weight:
-                pruned_value = []
-                prune = []
-                for j in value:
-                    size = len(j)
-                    if self.multiples[i]:
-                        p = 2 * j[size - 4] * (log(j[size - 3]) - log(j[size - 1])) - log(j[size - 4])
-                        if p > 0:
-                            pruned_value.append(j)
-                            prune.append(p)
-                    else:
-                        p = 2 * int(j[size - 3]) * (log(j[size - 5]) - log(j[size - 1])) - log(int(j[size - 3]))
-                        if p > 0:
-                            pruned_value.append(j)
-                            prune.append(p)
-                self.prunes.append(prune)
-                self.values.append(pruned_value)
-            elif not self.args.rule_prune and self.args.rule_weight:
-                raise Exception('Rule weighting requires rule pruning to be enabled.')
-            else:
-                self.values.append(value)
+                except (ValueError, ZeroDivisionError):
+                    # log(0) or log(negative) — row has zero count/probability, skip it
+                    pass
+            self.values_pruned.append(pruned_value)
+
+            # Keep self.values pointing at full for any in-memory use within
+            # motif_store (e.g. _adjust_matrices). motif_counter re-selects at load.
+            self.values.append(value)
         
         self._adjust_matrices()
     

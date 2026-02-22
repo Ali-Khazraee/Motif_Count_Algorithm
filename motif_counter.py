@@ -2,6 +2,7 @@
 
 import torch
 import pickle
+import time
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Optional
@@ -17,14 +18,30 @@ class RelationalMotifCounter:
     self.matrices  → template dict loaded from the pickle (DB schema only).
                      NEVER written after __init__.
 
-    Each call to count(graph_data) receives graph_data built by DataLoader:
-        graph_data['matrices']  → {relation_name: (N,N) tensor}   <- built by DataLoader
-        graph_data['features']  → (N, F) node features
-        graph_data['labels']    → edge-feature tensors | None
+    Each call to count(graph_data) receives graph_data built by DataLoader
+    and pre-processed by DataPreprocessor:
+        graph_data['matrices']             → {relation_name: (N_max, N_max) tensor}
+        graph_data['features']             → (N_max, F) node features  (pre-padded)
+        graph_data['feat_onehot']          → (N_max, D) one-hot features (pre-padded)
+        graph_data['feature_onehot_mapping'] → {col_idx: {val_int: oh_col_idx}}
+        graph_data['labels']               → edge-feature tensors | None (pre-padded)
+        graph_data['N_max']                → int — global N_max for the dataset
 
-    _build_local_inputs() reads graph_data['matrices'] DIRECTLY as local_matrices.
-    There is no copying or substitution from self.matrices.
-    The pattern is identical to reconstructed_x_slice / reconstructed_labels.
+    GRADIENT-SAFE feature predicates
+    ---------------------------------
+    The old code computed feature masks with:
+        (feat_b[:, :, indx] == val).float()          ← boolean, no gradient
+    This is replaced throughout by direct indexing into the pre-built one-hot
+    matrix:
+        feat_onehot_b[:, :, mapping[indx][val]]      ← pure slice, gradient ✓
+    The boolean comparison is performed ONCE during DataPreprocessor.preprocess()
+    — outside any gradient-tracked computation.
+
+    BATCHED design (count_batch)
+    ----------------------------
+    Since DataPreprocessor already pads ALL graphs to the global N_max, every
+    graph_data tensor has identical shape.  _build_batch_tensors() now only
+    needs to torch.stack() — no per-batch shape checks or zero-padding.
     """
 
     # ------------------------------------------------------------------
@@ -62,8 +79,6 @@ class RelationalMotifCounter:
         self.mask_indices          = data["mask_indices"]
         self.sort_indices          = data["sort_indices"]
         self.stack_indices         = data["stack_indices"]
-        self.values                = data["values"]
-        self.prunes                = data["prunes"]
         self.functors              = data["functors"]
         self.variables             = data["variables"]
         self.nodes                 = data["nodes"]
@@ -74,6 +89,25 @@ class RelationalMotifCounter:
         self.relation_feature_columns = data.get("relation_feature_columns", {})
         self.feature_info_mapping  = data.get("feature_info_mapping", {})
         self.num_nodes_graph       = data.get("num_nodes_graph", 0)
+
+        # ── Select value set based on --rule_prune ────────────────────
+        rule_prune = getattr(self.args, 'rule_prune', False)
+
+        if "values_full" in data:
+            # New-format pickle
+            if rule_prune:
+                self.values = data["values_pruned"]
+                n_full   = sum(len(v) for v in data["values_full"])
+                n_pruned = sum(len(v) for v in data["values_pruned"])
+                print(f"  rule_prune=True: {n_pruned} / {n_full} value combinations kept")
+            else:
+                self.values = data["values_full"]
+                print(f"  rule_prune=False: using all {sum(len(v) for v in data['values_full'])} value combinations")
+        else:
+            # Old-format pickle — use whatever was stored
+            self.values = data["values"]
+            print(f"  Warning: old-format pickle — delete db/{self.database_name}.pkl "
+                  f"to regenerate with both value sets cached.")
 
         self.device = getattr(self.args, 'device', 'cuda')
 
@@ -120,439 +154,416 @@ class RelationalMotifCounter:
         return selected
 
     # ------------------------------------------------------------------
-    # Main entry point
+    # Main entry point — batched (PARALLELISED OVER GRAPHS)
     # ------------------------------------------------------------------
 
-    def count(
+    def count_batch(
         self,
-        graph_data: Dict,
-        interactive: bool = False,
+        preprocessor: 'DataPreprocessor',
+        batch_size: int = 1000,
         selected_rules_values: Optional[Dict] = None,
-    ):
+    ) -> torch.Tensor:
         """
-        Count motifs for a single graph.
+        Count motifs for all graphs via batched GPU tensor ops.
+
+        Returns a (num_graphs, num_motifs) tensor. No .item() is called
+        anywhere in this path — gradient flows intact through all bmm
+        operations back to the adjacency tensors.
+
+        For inference/display, call .detach() on the result.
+        For training loss, use the result directly in F.mse_loss() etc.
 
         Parameters
         ----------
-        graph_data : dict  (built by DataLoader.get_graph_data_list)
-            'matrices'  – {relation_name: (N,N) tensor}  used directly as local_matrices
-            'features'  – (N, F) node features
-            'labels'    – edge-feature tensors | None
+        preprocessor : DataPreprocessor
+        batch_size   : graphs per GPU mini-batch
+        selected_rules_values : dict, optional — subset of rules to count
 
         Returns
         -------
-        List[float]                  when not interactive
-        Tuple[List[float], Dict]     when interactive=True and no pre-selection
+        torch.Tensor  shape (num_graphs, num_motifs)
         """
-        reconstructed_x_slice, reconstructed_labels, local_matrices = (
-            self._build_local_inputs(graph_data)
-        )
+        batch_tensors = []
+        total  = preprocessor.num_graphs
+        N_max  = preprocessor.N_max
+        fom    = preprocessor.feature_onehot_mapping
 
+        for start in range(0, total, batch_size):
+            end_excl = min(start + batch_size, total)
+            B        = end_excl - start
+            t0       = time.perf_counter()
+
+            feat_b, feat_onehot_b, adj_b, edge_b = preprocessor.get_batch(start, end_excl)
+
+            batch_result = self._iteration_function_batched(
+                feat_b, feat_onehot_b, edge_b, adj_b, fom, B, N_max,
+                selected_rules_values,
+            )                                                            # (B, num_motifs)
+
+            batch_tensors.append(batch_result)
+
+            # Sync so elapsed time reflects actual GPU completion, not just launch.
+            if self.device == 'cuda':
+                torch.cuda.synchronize()
+
+            elapsed        = time.perf_counter() - t0
+            graphs_per_sec = B / elapsed if elapsed > 0 else float('inf')
+            eta_sec        = (total - end_excl) / graphs_per_sec if graphs_per_sec > 0 else 0
+            print(
+                f"  Batch {start:>7}–{end_excl-1:<7}  [{B:>5} graphs]"
+                f"  {elapsed:>6.2f}s"
+                f"  ({graphs_per_sec:>8.1f} graphs/s)"
+                f"  {end_excl}/{total} done"
+                f"  ETA {self._fmt_time(eta_sec)}"
+            )
+
+        return torch.cat(batch_tensors, dim=0)                          # (num_graphs, num_motifs)
+
+    # ------------------------------------------------------------------
+    # Batched iteration loop  (unified — fully differentiable)
+    # ------------------------------------------------------------------
+
+    def _iteration_function_batched(
+        self,
+        feat_b:                torch.Tensor,                   # (B, N_max, F)
+        feat_onehot_b:         torch.Tensor,                   # (B, N_max, D)
+        edge_b:                Optional[List[torch.Tensor]],   # list[(B,C,N_max,N_max)] or None
+        adj_b:                 Dict[str, torch.Tensor],        # {rel: (B, N_max, N_max)}
+        feature_onehot_mapping: Dict[int, Dict[int, int]],
+        B:                     int,
+        N_max:                 int,
+        selected_rules_values: Optional[Dict] = None,
+    ) -> torch.Tensor:
+        """
+        Unified differentiable batched motif counting.
+
+        Returns (B, num_motifs) — no .item(), no detach(), no boolean
+        comparisons. Gradient flows intact through all bmm operations
+        back to adj_b tensors (and feat_onehot_b if it requires grad).
+
+        count_batch()               — call .detach() on result for display/inference
+        training loss               — use result directly in F.mse_loss() etc.
+        """
         if selected_rules_values is not None:
-            return self._iteration_function_selective(
-                reconstructed_x_slice, reconstructed_labels, local_matrices,
-                mode="test", selected_rules_values=selected_rules_values,
-            )
+            iteration_plan = [
+                (rule_idx, value_idx, self.values[rule_idx][value_idx])
+                for rule_idx, value_indices in selected_rules_values.items()
+                for value_idx in value_indices
+            ]
+        else:
+            iteration_plan = [
+                (table, indexx, table_row)
+                for table in range(len(self.rules))
+                for indexx, table_row in enumerate(self.values[table])
+            ]
 
-        if interactive:
-            selected_rules_values = self._interactive_rule_selection()
-            motif_counts = self._iteration_function_selective(
-                reconstructed_x_slice, reconstructed_labels, local_matrices,
-                mode="test", selected_rules_values=selected_rules_values,
-            )
-            return motif_counts, selected_rules_values
+        motif_tensors: List[torch.Tensor] = []   # each element: (B,)
 
-        return self._iteration_function(
-            reconstructed_x_slice, reconstructed_labels, local_matrices, mode="test"
-        )
+        for table, indexx, table_row in iteration_plan:
 
-    # ------------------------------------------------------------------
-    # Build per-graph inputs  ← THE KEY METHOD
-    # ------------------------------------------------------------------
-
-    def _build_local_inputs(
-        self, graph_data: Dict
-    ) -> Tuple[torch.Tensor, Any, Dict[str, torch.Tensor]]:
-        """
-        Extract the three independent per-graph inputs from graph_data.
-
-        local_matrices
-            Read directly from graph_data['matrices'].
-            The DataLoader built this dict with the correct relation keys
-            and the correct adjacency tensor for THIS graph.
-            self.matrices is NEVER read or copied here.
-
-        reconstructed_x_slice
-            graph_data['features']  — node feature tensor / array.
-
-        reconstructed_labels
-            graph_data['labels']    — edge features (QM9) or None (Cora).
-        """
-        # ---- adjacency dict: read directly from graph_data, no copy needed ----
-        local_matrices: Dict[str, torch.Tensor] = {
-            key: (mat.to(self.device) if isinstance(mat, torch.Tensor) else mat)
-            for key, mat in graph_data['matrices'].items()
-        }
-
-        # ---- node features ----
-        features = graph_data['features']
-        reconstructed_x_slice = (
-            features.to(self.device) if torch.is_tensor(features)
-            else torch.tensor(features).to(self.device)
-        )
-
-        # ---- edge/label features ----
-        reconstructed_labels = graph_data.get('labels', None)
-
-        return reconstructed_x_slice, reconstructed_labels, local_matrices
-
-    # ------------------------------------------------------------------
-    # Iteration loops
-    # ------------------------------------------------------------------
-
-    def _iteration_function(
-        self,
-        reconstructed_x_slice,
-        reconstructed_labels,
-        local_matrices: Dict,
-        mode: str,
-    ) -> List:
-        motif_list: List = []
-        functor_value_dict: Dict = {}
-        counter = counter_c1 = 0
-
-        for table in range(len(self.rules)):
-            for indexx, table_row in enumerate(self.values[table]):
-                count, functor_value_dict, counter, counter_c1 = (
-                    self._count_single_rule_value(
-                        table, indexx, table_row,
-                        reconstructed_x_slice, reconstructed_labels,
-                        local_matrices, mode,
-                        functor_value_dict, counter, counter_c1,
-                    )
-                )
-                motif_list.append(count)
-
-        return motif_list
-
-    def _iteration_function_selective(
-        self,
-        reconstructed_x_slice,
-        reconstructed_labels,
-        local_matrices: Dict,
-        mode: str,
-        selected_rules_values: Dict,
-    ) -> List:
-        motif_list: List = []
-        functor_value_dict: Dict = {}
-        counter = counter_c1 = 0
-
-        for rule_idx, value_indices in selected_rules_values.items():
-            print(f"\nCounting Rule {rule_idx + 1}: {self.rules[rule_idx]}")
-            for value_idx in value_indices:
-                table_row = self.values[rule_idx][value_idx]
-                count, functor_value_dict, counter, counter_c1 = (
-                    self._count_single_rule_value(
-                        rule_idx, value_idx, table_row,
-                        reconstructed_x_slice, reconstructed_labels,
-                        local_matrices, mode,
-                        functor_value_dict, counter, counter_c1,
-                    )
-                )
-                motif_list.append(count)
-                print(f"  Value combination {value_idx}: {count}")
-
-        return motif_list
-
-    # ------------------------------------------------------------------
-    # Core counting pipeline
-    # ------------------------------------------------------------------
-
-    def _count_single_rule_value(
-        self, table, indexx, table_row,
-        reconstructed_x_slice, reconstructed_labels,
-        local_matrices: Dict,
-        mode: str,
-        functor_value_dict: dict,
-        counter: int, counter_c1: int,
-    ):
-        unmasked, functor_value_dict, counter, counter_c1 = (
-            self._compute_unmasked_matrices(
+            unmasked = self._compute_unmasked_matrices_batched(
                 table, table_row,
-                reconstructed_x_slice, reconstructed_labels,
-                local_matrices, mode,
-                functor_value_dict, counter, counter_c1,
+                feat_b, feat_onehot_b, feature_onehot_mapping,
+                edge_b, adj_b, B, N_max
             )
-        )
-        masked   = self._compute_masked_matrices(unmasked, self.base_indices[table], self.mask_indices[table])
-        sorted_  = self._compute_sorted_matrices(masked, self.sort_indices[table])
-        stacked  = self._compute_stacked_matrices(sorted_, self.stack_indices[table])
-        result   = self._compute_result(stacked)
+            masked  = self._compute_masked_matrices_batched(
+                unmasked, self.base_indices[table], self.mask_indices[table]
+            )
+            sorted_ = self._compute_sorted_matrices_batched(
+                masked, self.sort_indices[table]
+            )
+            stacked = self._compute_stacked_matrices_batched(
+                sorted_, self.stack_indices[table], B
+            )
+            result  = self._compute_result_batched(stacked)             # (B,)
 
-        count = (torch.sum(result) * self.prunes[table][indexx]
-                 if self.args.rule_weight else torch.sum(result))
+            motif_tensors.append(result)
 
-        del unmasked, masked, sorted_, stacked, result
-        return count, functor_value_dict, counter, counter_c1
+            del unmasked, masked, sorted_, stacked
+
+        if not motif_tensors:
+            # No rules matched — return zero tensor of shape (B, 0)
+            device = next(iter(adj_b.values())).device
+            return torch.zeros(B, 0, dtype=torch.float32, device=device)
+
+        return torch.stack(motif_tensors, dim=1)                        # (B, num_motifs)
 
     # ------------------------------------------------------------------
-    # Unmasked matrix computation
+    # Batched state handlers
     # ------------------------------------------------------------------
 
-    def _compute_unmasked_matrices(
-        self, table, table_row,
-        reconstructed_x_slice, reconstructed_labels,
-        local_matrices: Dict,
-        mode: str,
-        functor_value_dict: dict,
-        counter: int, counter_c1: int,
-    ):
-        unmasked_matrices = []
+    def _compute_unmasked_matrices_batched(
+        self,
+        table:                 int,
+        table_row,
+        feat_b:                torch.Tensor,                  # (B, N_max, F)
+        feat_onehot_b:         torch.Tensor,                  # (B, N_max, D)
+        feature_onehot_mapping: Dict[int, Dict[int, int]],
+        edge_b:                Optional[List[torch.Tensor]],
+        adj_b:                 Dict[str, torch.Tensor],
+        B:                     int,
+        N_max:                 int,
+    ) -> List[torch.Tensor]:
+        """Batched counterpart of _compute_unmasked_matrices (mode='test' path only)."""
+        unmasked: List[torch.Tensor] = []
 
         for column in range(len(self.rules[table])):
             functor             = self.functors[table][column]
             table_functor_value = table_row[column + self.multiples[table]]
-            fvd_key             = (table_functor_value, functor, '0', ('0', '0', '0'))
-
-            if mode == 'metric_observed' and self.states[table][column] != 1:
-                cached = functor_value_dict.get(fvd_key)
-                if cached is not None:
-                    unmasked_matrices.append(cached)
-                    counter += 1
-                    continue
-
-            state = self.states[table][column]
+            state               = self.states[table][column]
 
             if state == 0:
-                matrix = self._compute_state_zero(
-                    functor, table_functor_value, self.nodes[table][column],
-                    reconstructed_x_slice, reconstructed_labels, mode,
-                )
-                unmasked_matrices.append(matrix)
-                if mode == 'metric_observed':
-                    functor_value_dict[fvd_key] = matrix
-
-            elif state == 1:
-                matrices_list, functor_value_dict, counter, counter_c1 = (
-                    self._compute_state_one(
+                unmasked.append(
+                    self._compute_state_zero_batched(
                         functor, table_functor_value,
-                        self.variables[table][column],
-                        self.nodes[table][column],
-                        self.masks[table][column],
-                        reconstructed_x_slice, reconstructed_labels,
-                        local_matrices, mode,
-                        functor_value_dict, counter, counter_c1,
+                        feat_b, feat_onehot_b, feature_onehot_mapping,
                     )
                 )
-                unmasked_matrices.extend(matrices_list)
-
+            elif state == 1:
+                mats = self._compute_state_one_batched(
+                    functor, table_functor_value,
+                    self.variables[table][column],
+                    self.masks[table][column],
+                    feat_b, feat_onehot_b, feature_onehot_mapping,
+                )
+                unmasked.extend(mats)
             elif state == 2:
-                matrix = self._compute_state_two(functor, table_functor_value, local_matrices)
-                unmasked_matrices.append(matrix)
-                if mode == 'metric_observed':
-                    functor_value_dict[fvd_key] = matrix
-
+                unmasked.append(
+                    self._compute_state_two_batched(functor, table_functor_value, adj_b)
+                )
             elif state == 3:
-                matrix = self._compute_state_three(
-                    reconstructed_labels, functor, table_functor_value
+                unmasked.append(
+                    self._compute_state_three_batched(edge_b, functor, table_functor_value)
                 )
-                unmasked_matrices.append(matrix)
-                if mode == 'metric_observed':
-                    functor_value_dict[fvd_key] = matrix
 
-        return unmasked_matrices, functor_value_dict, counter, counter_c1
+        return unmasked
 
-    # ------------------------------------------------------------------
-    # State handlers
-    # ------------------------------------------------------------------
-
-    def _compute_state_zero(
-        self, functor, table_functor_value, functor_address,
-        reconstructed_x_slice, reconstructed_labels, mode,
-    ):
-        if mode == 'metric_observed':
-            primary_key = self.keys[functor_address]
-            matrix = torch.zeros(
-                (len(self.entities[functor_address].index), 1), device=self.device
-            )
-            for entity_index in range(len(self.entities[functor_address][functor])):
-                functor_value = self.entities[functor_address][functor][entity_index]
-                if isinstance(table_functor_value, str):
-                    if isinstance(functor_value, (np.int64, np.int32)):
-                        functor_value = str(functor_value)
-                    elif isinstance(functor_value, (np.float64, np.float32)):
-                        functor_value = str(int(functor_value))
-                if functor_value == table_functor_value:
-                    key_index = self.entities[functor_address][primary_key][entity_index]
-                    row_index = self.indices[primary_key][key_index]
-                    matrix[row_index][0] = 1
-        else:
-            found, indx, entity_or_relation_key = self._find_feature(functor)
-            if found:
-                table_functor_value = int(table_functor_value)
-                if self.args.test_local_mults:
-                    fv = (reconstructed_x_slice[entity_or_relation_key][:, indx]
-                          if self.args.graph_type == 'heterogeneous'
-                          else reconstructed_x_slice[:, indx])
-                    matrix = (fv == table_functor_value).float().view(-1, 1)
-            else:
-                matrix = (
-                    reconstructed_labels[:, int(table_functor_value)]
-                    .float().view(-1, 1).to(self.device)
-                )
-        return matrix
-
-    def _compute_state_one(
+    def _compute_state_zero_batched(
         self,
-        functor, table_functor_value, variable, functor_address, masks_list,
-        reconstructed_x_slice, reconstructed_labels,
-        local_matrices: Dict,
-        mode: str,
-        functor_value_dict: dict,
-        counter: int, counter_c1: int,
-    ):
-        matrices_list = []
-        primary_key = self.keys[functor_address]
+        functor:               str,
+        table_functor_value,
+        feat_b:                torch.Tensor,                  # (B, N_max, F)
+        feat_onehot_b:         torch.Tensor,                  # (B, N_max, D)
+        feature_onehot_mapping: Dict[int, Dict[int, int]],
+    ) -> torch.Tensor:
+        """
+        Unary feature predicate.
+        Returns (B, N_max, 1)  — 1 where node matches the predicate, 0 elsewhere.
+
+        GRADIENT-SAFE: uses a direct column slice of the pre-built one-hot
+        matrix instead of the old boolean comparison `(fv == val).float()`.
+
+        Padding rows in feat_onehot_b are all-zero by construction, so padded
+        nodes naturally contribute 0 to all downstream products.
+        """
+        found, indx, _ = self._find_feature(functor)
+        if found:
+            val      = int(table_functor_value)
+            col_map  = feature_onehot_mapping.get(indx, {})
+            if val in col_map:
+                oh_col = col_map[val]
+                # Direct index into pre-built one-hot — no == comparison here
+                return feat_onehot_b[:, :, oh_col].unsqueeze(2)      # (B, N_max, 1)
+            else:
+                # Value not seen during preprocessing — return zeros
+                return torch.zeros(
+                    feat_onehot_b.shape[0], feat_onehot_b.shape[1], 1,
+                    dtype=torch.float32, device=self.device,
+                )
+
+        # Fallback: treat value as a raw feature column index (e.g. label column)
+        col = int(table_functor_value)
+        return feat_b[:, :, col].float().unsqueeze(2)                 # (B, N_max, 1)
+
+    def _compute_state_one_batched(
+        self,
+        functor:               str,
+        table_functor_value,
+        variable:              str,
+        masks_list:            List,
+        feat_b:                torch.Tensor,                  # (B, N_max, F)
+        feat_onehot_b:         torch.Tensor,                  # (B, N_max, D)
+        feature_onehot_mapping: Dict[int, Dict[int, int]],
+    ) -> List[torch.Tensor]:
+        """
+        Masked-variable predicate.
+        Returns one (B, N_max, 1) or (B, 1, N_max) tensor per mask entry.
+
+        GRADIENT-SAFE: same one-hot index strategy as _compute_state_zero_batched.
+        """
+        mats: List[torch.Tensor] = []
+        found, indx, _ = self._find_feature(functor)
 
         for mask_info in masks_list:
-            fvd_key = (table_functor_value, functor, variable, tuple(mask_info))
-
-            if mode == 'metric_observed':
-                cached = functor_value_dict.get(fvd_key)
-                if cached is not None:
-                    matrices_list.append(cached)
-                    counter += 1
-                    counter_c1 += 1
-                    continue
-
-                # Shape from the local matrix for THIS graph
-                if variable == mask_info[1]:
-                    matrix = torch.zeros(
-                        (local_matrices[mask_info[0]].shape[0], 1), device=self.device
-                    )
+            if found:
+                val     = int(table_functor_value)
+                col_map = feature_onehot_mapping.get(indx, {})
+                if val in col_map:
+                    oh_col   = col_map[val]
+                    col_vals = feat_onehot_b[:, :, oh_col]            # (B, N_max)
                 else:
-                    matrix = torch.zeros(
-                        (1, local_matrices[mask_info[0]].shape[1]), device=self.device
+                    col_vals = torch.zeros(
+                        feat_onehot_b.shape[0], feat_onehot_b.shape[1],
+                        dtype=torch.float32, device=self.device,
                     )
 
-                for entity_index in range(len(self.entities[functor_address][functor])):
-                    functor_value = self.entities[functor_address][functor][entity_index]
-                    if functor_value == table_functor_value:
-                        key_index = self.entities[functor_address][primary_key][entity_index]
-                        index = self.indices[primary_key][key_index]
-                        if variable == mask_info[1]:
-                            matrix[index, 0] = 1
-                        else:
-                            matrix[0, index] = 1
-
-                matrices_list.append(matrix)
-                functor_value_dict[fvd_key] = matrix
-
+                if variable == mask_info[1]:
+                    mats.append(col_vals.unsqueeze(2))                # (B, N_max, 1)
+                else:
+                    mats.append(col_vals.unsqueeze(1))                # (B, 1, N_max)
             else:
+                # Fallback: raw feature column
+                col = int(table_functor_value)
+                fv  = feat_b[:, :, col].float()                       # (B, N_max)
                 if variable == mask_info[1]:
-                    matrix = self._compute_state_one_variable(
-                        functor, table_functor_value, functor_address,
-                        reconstructed_x_slice, reconstructed_labels,
-                    )
+                    mats.append(fv.unsqueeze(2))                      # (B, N_max, 1)
                 else:
-                    matrix = self._compute_state_one_variable_transpose(
-                        functor, table_functor_value, functor_address,
-                        reconstructed_x_slice, reconstructed_labels,
-                    )
-                matrices_list.append(matrix)
+                    mats.append(fv.unsqueeze(1))                      # (B, 1, N_max)
 
-        return matrices_list, functor_value_dict, counter, counter_c1
+        return mats
 
-    def _compute_state_one_variable(
-        self, functor, table_functor_value, functor_address,
-        reconstructed_x_slice, reconstructed_labels,
-    ):
-        found, indx, entity_or_relation_key = self._find_feature(functor)
-        if found:
-            table_functor_value = int(table_functor_value)
-            if self.args.test_local_mults:
-                fv = (reconstructed_x_slice[entity_or_relation_key][:, indx]
-                      if self.args.graph_type == 'heterogeneous'
-                      else reconstructed_x_slice[:, indx])
-                matrix = (fv == table_functor_value).float().view(-1, 1)
-        else:
-            matrix = reconstructed_labels[:, int(table_functor_value)].float().view(-1, 1)
-        return matrix
+    def _compute_state_two_batched(
+        self,
+        functor: str,
+        table_functor_value,
+        adj_b: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Adjacency / relation matrix.
+        Returns (B, N_max, N_max).
+        """
+        adj = adj_b[functor]                                          # (B, N_max, N_max)
+        return (1 - adj) if table_functor_value == 'F' else adj
 
-    def _compute_state_one_variable_transpose(
-        self, functor, table_functor_value, functor_address,
-        reconstructed_x_slice, reconstructed_labels,
-    ):
-        found, indx, entity_or_relation_key = self._find_feature(functor)
-        if found:
-            table_functor_value = int(table_functor_value)
-            if self.args.test_local_mults:
-                fv = (reconstructed_x_slice[entity_or_relation_key][:, indx]
-                      if self.args.graph_type == 'heterogeneous'
-                      else reconstructed_x_slice[:, indx])
-                matrix = (fv == table_functor_value).float().view(1, -1)
-        else:
-            matrix = (
-                reconstructed_labels[:, int(table_functor_value)]
-                .view(1, -1).to(self.device)
-            )
-        return matrix
+    def _compute_state_three_batched(
+        self,
+        edge_b: List[torch.Tensor],   # list of (B, C, N_max, N_max)
+        functor: str,
+        table_functor_value,
+    ) -> torch.Tensor:
+        """
+        Edge feature predicate (QM9 bond types).
+        Returns (B, N_max, N_max).
+        """
+        feature_idx = next(
+            idx for idx, info in self.feature_info_mapping.items()
+            if info['feature_name'] == functor
+        )
+        target = edge_b[feature_idx]                                  # (B, C, N_max, N_max)
 
-    def _compute_state_two(self, functor, table_functor_value, local_matrices: Dict):
-        """Read adjacency from local_matrices (which came from graph_data['matrices'])."""
-        if table_functor_value == 'F':
-            return 1 - local_matrices[functor]
-        return local_matrices[functor]
-
-    def _compute_state_three(self, reconstructed_labels, functor, table_functor_value):
-        feature_idx = None
-        for idx, info in self.feature_info_mapping.items():
-            if info['feature_name'] == functor:
-                feature_idx = idx
-                break
-        target_tensor = reconstructed_labels[feature_idx]
         if table_functor_value == 'N/A':
-            return torch.sum(target_tensor, dim=0)
+            return torch.sum(target, dim=1)                           # (B, N_max, N_max)
+
         value_mapping   = self.feature_info_mapping[feature_idx]['value_index_mapping']
         reverse_mapping = {v: k for k, v in value_mapping.items()}
-        return target_tensor[reverse_mapping[int(table_functor_value)]]
+        val_idx         = reverse_mapping[int(table_functor_value)]
+        return target[:, val_idx, :, :]                               # (B, N_max, N_max)
 
     # ------------------------------------------------------------------
-    # Matrix algebra helpers
+    # Batched matrix algebra
     # ------------------------------------------------------------------
 
-    def _compute_masked_matrices(self, unmasked, base_indices, mask_indices):
+    def _compute_masked_matrices_batched(
+        self,
+        unmasked:     List[torch.Tensor],
+        base_indices: List[int],
+        mask_indices: List[List[int]],
+    ) -> List[torch.Tensor]:
+        """
+        Element-wise masking — identical logic to the single-graph version.
+        Tensors carry a leading batch dimension but broadcasting handles it.
+        """
         masked = [unmasked[k] for k in base_indices]
         for k in mask_indices:
-            masked[k[0]] = torch.mul(masked[k[0]], unmasked[k[1]])
+            masked[k[0]] = masked[k[0]] * unmasked[k[1]]
         return masked
 
-    def _compute_sorted_matrices(self, masked, sort_indices):
-        return [masked[k[1]].T if k[0] else masked[k[1]] for k in sort_indices]
-
-    def _compute_stacked_matrices(self, sorted_, stack_indices):
-        stacked = sorted_.copy()
-        pop_counter = 0
-        for k in stack_indices:
-            for _ in range(k[1] - k[0] - pop_counter):
-                stacked[k[0]] = torch.mm(stacked[k[0]], stacked[k[0] + 1])
-                stacked.pop(k[0] + 1)
-                pop_counter += 1
-            stacked[k[0]] = torch.mul(
-                stacked[k[0]],
-                torch.eye(len(stacked[k[0]]), device=self.device),
-            )
-        return stacked
-
-    def _compute_result(self, stacked):
-        result = stacked[0]
-        for k in range(1, len(stacked)):
-            result = torch.mm(result, stacked[k])
+    def _compute_sorted_matrices_batched(
+        self,
+        masked:       List[torch.Tensor],
+        sort_indices: List,
+    ) -> List[torch.Tensor]:
+        """
+        Transpose swaps dims 1 and 2 (batch dim 0 is untouched).
+          (B, N, 1)  ↔  (B, 1, N)
+          (B, N, N)  ↔  (B, N, N)^T
+        """
+        result = []
+        for si in sort_indices:
+            m = masked[si[1]]
+            result.append(m.transpose(1, 2) if si[0] else m)
         return result
 
+    def _compute_stacked_matrices_batched(
+        self,
+        sorted_:       List[torch.Tensor],
+        stack_indices: List,
+        B:             int,
+    ) -> List[torch.Tensor]:
+        """
+        Batched matrix chain multiplication using torch.bmm.
+        The diagonal masking step uses a (B, N, N) identity expanded over B.
+
+        Key shapes (example for a 3-atom rule):
+          (B, 1, N) @ (B, N, N) = (B, 1, N)
+          (B, 1, N) @ (B, N, 1) = (B, 1, 1)   → squeezed to (B,) by _compute_result_batched
+        """
+        stacked     = sorted_.copy()
+        pop_counter = 0
+
+        for k in stack_indices:
+            for _ in range(k[1] - k[0] - pop_counter):
+                stacked[k[0]] = torch.bmm(stacked[k[0]], stacked[k[0] + 1])
+                stacked.pop(k[0] + 1)
+                pop_counter += 1
+
+            # Diagonal masking — only for square matrices
+            mat = stacked[k[0]]
+            if mat.shape[1] == mat.shape[2]:
+                N   = mat.shape[1]
+                eye = (
+                    torch.eye(N, dtype=torch.float32, device=self.device)
+                    .unsqueeze(0)
+                    .expand(B, -1, -1)
+                )
+                stacked[k[0]] = mat * eye
+
+        return stacked
+
+    def _compute_result_batched(
+        self,
+        stacked: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Final batched chain multiply → sum all spatial dims → (B,).
+
+        The spatial shape after multiplication is NOT always (B, 1, 1):
+          - Relational rules  (B, 1, N) @ (B, N, N) @ (B, N, 1) = (B, 1, 1)
+          - Unary rules       result stays (B, N, 1) or (B, N, N)
+
+        Mirroring the single-graph path which does torch.sum(result) over
+        the whole matrix, we flatten every dim except the batch dim and sum.
+        This is correct for all rule types.
+        """
+        result = stacked[0]
+        for k in range(1, len(stacked)):
+            result = torch.bmm(result, stacked[k])
+        # Sum over all spatial dimensions, keep only the batch dimension
+        return result.reshape(result.shape[0], -1).sum(dim=1)         # (B,)
     # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fmt_time(seconds: float) -> str:
+        """Human-readable duration string."""
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        m, s = divmod(seconds, 60)
+        if m < 60:
+            return f"{int(m)}m {s:.0f}s"
+        h, m = divmod(m, 60)
+        return f"{int(h)}h {int(m)}m {s:.0f}s"
 
     def _find_feature(self, functor: str) -> Tuple[bool, Optional[int], Optional[str]]:
         for key, feature_list in self.entity_feature_columns.items():
@@ -570,25 +581,33 @@ class RelationalMotifCounter:
     def get_rule_motif_mapping(self) -> List[Tuple[int, int]]:
         return [(i, len(self.values[i])) for i in range(len(self.rules))]
 
-    def aggregate_motif_counts(self, all_motif_counts: List[List]) -> List[float]:
-        if not all_motif_counts:
-            return []
-        aggregated = [0.0] * len(all_motif_counts[0])
-        for graph_counts in all_motif_counts:
-            for idx, count in enumerate(graph_counts):
-                aggregated[idx] += count.item() if isinstance(count, torch.Tensor) else count
-        return aggregated
+    def aggregate_motif_counts(self, counts: torch.Tensor) -> torch.Tensor:
+        """
+        Sum motif counts across all graphs.
+
+        Parameters
+        ----------
+        counts : (num_graphs, num_motifs) tensor — output of count_batch()
+
+        Returns
+        -------
+        (num_motifs,) tensor — summed counts, gradient intact.
+        Call .detach().tolist() for display.
+        """
+        return counts.sum(dim=0)                                        # (num_motifs,)
 
     def display_rules_and_motifs(
-        self, aggregated_counts: List[float], selected_rules_values: Dict = None
+        self, aggregated_counts: torch.Tensor, selected_rules_values: Dict = None
     ):
+        # Convert to plain list only at the display boundary
+        counts_list = aggregated_counts.detach().cpu().tolist()
         print("\n" + "="*80)
         print("RULES AND MOTIF COUNTS")
         print("="*80)
         if selected_rules_values is not None:
-            self._display_selective_results(aggregated_counts, selected_rules_values)
+            self._display_selective_results(counts_list, selected_rules_values)
         else:
-            self._display_full_results(aggregated_counts)
+            self._display_full_results(counts_list)
 
     def _display_full_results(self, aggregated_counts: List[float]):
         count_idx = 0
@@ -683,10 +702,38 @@ class RelationalMotifCounter:
                         break
                     print("  Error: no valid values selected. Try again.")
 
-            filtered = self._filter_combinations_by_functor_values(
-                rule_idx, selected_functor_values
-            )
-            print(f"\n  -> {len(filtered)} combinations match your selection")
+            while True:
+                filtered = self._filter_combinations_by_functor_values(
+                    rule_idx, selected_functor_values
+                )
+                if filtered:
+                    print(f"\n  -> {len(filtered)} combinations match your selection")
+                    break
+                print(f"\n  -> 0 combinations match your selection — no rows in the database "
+                      f"have this exact combination. Please try different values.")
+                # Re-prompt all functors for this rule
+                selected_functor_values = {}
+                for functor_name, unique_values in functor_value_options.items():
+                    print(f"\n{functor_name}\n  Possible values: {unique_values}")
+                    while True:
+                        val_sel = input("  Select values (comma-separated, or 'all'): ").strip()
+                        if val_sel.lower() == 'all':
+                            selected_functor_values[functor_name] = unique_values
+                            break
+                        selected_vals, invalid_vals = [], []
+                        for v in val_sel.split(','):
+                            matched = self._match_value_to_options(v.strip(), unique_values)
+                            if matched is not None:
+                                selected_vals.append(matched)
+                            else:
+                                invalid_vals.append(v.strip())
+                        for iv in invalid_vals:
+                            print(f"  Warning: '{iv}' is not a valid option")
+                        if selected_vals:
+                            selected_functor_values[functor_name] = selected_vals
+                            break
+                        print("  Error: no valid values selected. Try again.")
+
             selected_rules_values[rule_idx] = filtered
 
         return selected_rules_values
